@@ -1,0 +1,201 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Khovanskiy <a@khovanskiy.ru>
+Date: Sat, 19 Sep 2026 11:01:00 +0300
+Subject: [PATCH 3/3] driver: report SQLSTATE of errors and the number of
+ affected rows
+
+execute returns three values now. On an error the server reported,
+the connection raises box.error of type PgError with the field
+sqlstate: the caller tells a serialization failure (40001) from a
+syntax error (42601) by the code, not by the localized text. Errors
+without a code - a broken connection, a cancelled fiber - stay plain
+strings, as before.
+
+On success the third value is the number of rows the last command
+affected (PQcmdTuples): INSERT, UPDATE, DELETE, SELECT and others that
+report a count; nil for commands that report none (CREATE, BEGIN).
+---
+ pg/driver.c | 73 ++++++++++++++++++++++++++++++++++++++++++++++++-----
+ pg/init.lua | 23 ++++++++++++++---
+ 2 files changed, 87 insertions(+), 9 deletions(-)
+
+diff --git a/pg/driver.c b/pg/driver.c
+index f63ff89..0ab4148 100644
+--- a/pg/driver.c
++++ b/pg/driver.c
+@@ -201,11 +201,38 @@ pg_wait_for_result(PGconn *conn)
+ 	return 1;
+ }
+ 
++/**
++ * What execute has learned so far: the next result set number,
++ * whether an error triple (status, message, SQLSTATE) is on the
++ * stack, and the row count of the last command that reports one.
++ */
++struct pg_exec_state {
++	int res_no;
++	int failed;
++	int has_affected;
++	long long affected;
++};
++
++/**
++ * Remember the number of rows the command affected: PQcmdTuples
++ * is empty for commands without a count (CREATE, BEGIN, SET).
++ */
++static void
++pg_count_affected(PGresult *res, struct pg_exec_state *state)
++{
++	const char *tuples = PQcmdTuples(res);
++	if (tuples[0] == '\0')
++		return;
++	state->affected = strtoll(tuples, NULL, 10);
++	state->has_affected = 1;
++}
++
+ /**
+  * Appends result from postgres to lua table
+  */
+ static int
+-pg_resultget(struct lua_State *L, PGconn *conn, int *res_no, int status_ok)
++pg_resultget(struct lua_State *L, PGconn *conn, struct pg_exec_state *state,
++	     int status_ok)
+ {
+ 	int wait_res = pg_wait_for_result(conn);
+ 	if (wait_res != 1)
+@@ -215,6 +242,9 @@ pg_resultget(struct lua_State *L, PGconn *conn, int *res_no, int status_ok)
+ 			safe_pushstring(L, "Fiber was cancelled");
+ 		else
+ 			lua_pushstring(L, PQerrorMessage(conn));
++		/* No SQLSTATE: the server did not answer. */
++		lua_pushnil(L);
++		state->failed = 1;
+ 		return 0;
+ 	}
+ 
+@@ -230,15 +260,18 @@ pg_resultget(struct lua_State *L, PGconn *conn, int *res_no, int status_ok)
+ 	int res = -1;
+ 	int fail = 0;
+ 	int status = PQresultStatus(pg_res);
++	const char *sqlstate = NULL;
+ 	switch (status) {
+ 		case PGRES_TUPLES_OK:
+-			lua_pushinteger(L, (*res_no)++);
++			lua_pushinteger(L, state->res_no++);
+ 			lua_pushcfunction(L, safe_pg_parsetuples);
+ 			lua_pushlightuserdata(L, pg_res);
+ 			fail = lua_pcall(L, 1, 1, 0);
+ 			if (!fail)
+ 				lua_settable(L, -3);
+ 		case PGRES_COMMAND_OK:
++			if (!fail)
++				pg_count_affected(pg_res, state);
+ 			res = 1;
+ 			break;
+ 		case PGRES_FATAL_ERROR:
+@@ -247,16 +280,33 @@ pg_resultget(struct lua_State *L, PGconn *conn, int *res_no, int status_ok)
+ 			lua_pushinteger(L,
+ 				(PQstatus(conn) == CONNECTION_BAD) ? -1: 1);
+ 			fail = safe_pushstring(L, PQerrorMessage(conn));
++			if (fail)
++				break;
++			/*
++			 * The code tells a serialization failure from a
++			 * syntax error without parsing the localized text.
++			 */
++			sqlstate = PQresultErrorField(pg_res, PG_DIAG_SQLSTATE);
++			if (sqlstate != NULL)
++				fail = safe_pushstring(L, (char *)sqlstate);
++			else
++				lua_pushnil(L);
++			state->failed = 1;
+ 			break;
+ 		default:
+ 			lua_pushinteger(L, -1);
+ 			fail = safe_pushstring(L,
+ 				"Unwanted execution result status");
++			if (!fail)
++				lua_pushnil(L);
++			state->failed = 1;
+ 	}
+ 
+ 	PQclear(pg_res);
+ 	if (fail) {
+ 		lua_push_error(L);
++		lua_pushnil(L);
++		state->failed = 1;
+ 		res = -1;
+ 	}
+ 	return res;
+@@ -350,11 +400,22 @@ lua_pg_execute(struct lua_State *L)
+ 	lua_pushinteger(L, 0);
+ 	lua_newtable(L);
+ 
+-	int res_no = 1;
++	struct pg_exec_state state = { 1, 0, 0, 0 };
+ 	int status_ok = 1;
+-	while ((status_ok = pg_resultget(L, conn, &res_no, status_ok)));
+-
+-	return 2;
++	while ((status_ok = pg_resultget(L, conn, &state, status_ok)));
++
++	/*
++	 * Three values either way: the error triple (status, message,
++	 * SQLSTATE) or 0, the result sets and the number of rows the
++	 * last command affected (nil if it reports none).
++	 */
++	if (state.failed)
++		return 3;
++	if (state.has_affected)
++		lua_pushinteger(L, state.affected);
++	else
++		lua_pushnil(L);
++	return 3;
+ }
+ 
+ /**
+diff --git a/pg/init.lua b/pg/init.lua
+index b1000d6..9e1d8ba 100644
+--- a/pg/init.lua
++++ b/pg/init.lua
+@@ -7,6 +7,21 @@ local ffi = require('ffi')
+ local pool_mt
+ local conn_mt
+ 
++-- An error the server reported carries its SQLSTATE: the caller tells
++-- a serialization failure from a syntax error by the code, not by the
++-- localized text. Errors without a code (a broken connection, a
++-- cancelled fiber) stay plain strings, as before.
++local function query_error(message, sqlstate)
++    if sqlstate == nil then
++        return message
++    end
++    return box.error.new({
++        type = 'PgError',
++        reason = message,
++        sqlstate = sqlstate,
++    })
++end
++
+ --create a new connection
+ local function conn_create(pg_conn)
+     local queue = fiber.channel(1)
+@@ -60,13 +75,15 @@ conn_mt = {
+                 self.queue:put(false)
+                 return get_error(self.raise.pool, 'Connection is broken')
+             end
+-            local status, datas = self.conn:execute(sql, ...)
++            local status, datas, extra = self.conn:execute(sql, ...)
+             if status ~= 0 then
+                 self.queue:put(status > 0)
+-                return error(datas)
++                return error(query_error(datas, extra))
+             end
+             self.queue:put(true)
+-            return datas, true
++            -- The third value is the number of rows the last command
++            -- affected, nil for commands that report none.
++            return datas, true, extra
+         end,
+         begin = function(self)
+             return self:execute('BEGIN') ~= nil

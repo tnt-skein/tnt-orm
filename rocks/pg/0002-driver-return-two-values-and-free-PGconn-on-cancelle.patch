@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Khovanskiy <a@khovanskiy.ru>
+Date: Sat, 19 Sep 2026 11:01:00 +0300
+Subject: [PATCH 2/3] driver: return two values and free PGconn on cancelled
+ connect
+
+A cancelled connect returned one value instead of two: the caller got
+the message as the status and failed with 'attempt to compare string
+with number'. The half-open PGconn was never finished, so its socket
+stayed open until the process exit.
+---
+ pg/driver.c | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/pg/driver.c b/pg/driver.c
+index 0de3c77..f63ff89 100644
+--- a/pg/driver.c
++++ b/pg/driver.c
+@@ -508,9 +508,15 @@ lua_pg_connect(struct lua_State *L)
+ 	PostgresPollingStatusType status = PGRES_POLLING_WRITING;
+ 	while (true) {
+ 		if (fiber_is_cancelled()) {
++			/*
++			 * Return the status and the message, as every other
++			 * branch does, and release the half-open connection:
++			 * nobody else holds a reference to it.
++			 */
++			PQfinish(conn);
+ 			lua_pushinteger(L, -2);
+-			safe_pushstring(L, "Fiber was cancelled");
+-			return 1;
++			int fail = safe_pushstring(L, "Fiber was cancelled");
++			return fail ? lua_push_error(L): 2;
+ 		}
+ 
+ 		int sock = PQsocket(conn);
